@@ -13,6 +13,14 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
+from .rebasing import (
+    APP_LABEL,
+    NEW_BASE_LABEL,
+    OLD_BASE_LABEL,
+    RebaseError,
+    RebaseOverlayError,
+    rebase_image,
+)
 from .sample_image import build_sample_image
 from .unpacker import CHUNK, UnpackError, unpack_image
 
@@ -48,6 +56,10 @@ app = FastAPI(
         "* hardlink overwrite is byte-safe for the other end;\n"
         "* paths and links can never escape the per-request sandbox;\n"
         "* any missing/corrupt/illegal input fails the whole request.\n\n"
+        "`POST /rebase` swaps a patched base under an application image: "
+        "upload the app image, the old base and the new base (same-platform "
+        "single-manifest OCI layouts); the response is a self-contained "
+        "rebased layout tar that is trial-unpacked before download.\n\n"
         "Try it: download `GET /sample-image`, then upload it to `POST /unpack`."
     ),
     lifespan=lifespan,
@@ -61,6 +73,7 @@ def root():
         "docs": "/docs",
         "endpoints": {
             "unpack": "POST /unpack",
+            "rebase": "POST /rebase",
             "sample_image": "GET /sample-image",
             "healthz": "GET /healthz",
         },
@@ -123,5 +136,101 @@ def unpack(
         rootfs_tar,
         media_type="application/x-tar",
         filename="rootfs.tar",
+        background=BackgroundTask(partial(shutil.rmtree, work, ignore_errors=True)),
+    )
+
+
+def _stream_upload(upload, dest_path):
+    """Spool an upload to disk without buffering it in memory."""
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(upload.file, out, CHUNK)
+
+
+@app.post(
+    "/rebase",
+    summary="Rebase an application image onto a new base image (offline base swap)",
+    response_description="A self-contained, trial-unpacked OCI Image Layout tar "
+    "combining the new base with the application's own layers",
+    responses={
+        200: {"content": {"application/x-tar": {}}},
+        400: {
+            "description": "Verification or layer-overlay failure. Overlay errors "
+            "return the originating input package, the original 1-based layer "
+            "number and the entry path; nothing is returned."
+        },
+    },
+)
+def rebase(
+    app_image: UploadFile | None = File(
+        default=None,
+        alias="app_image",
+        description="Application OCI Image Layout tar (old base + app layers)",
+    ),
+    old_base: UploadFile | None = File(
+        default=None,
+        alias="old_base",
+        description="Old base OCI Image Layout tar (prefix of the application image)",
+    ),
+    new_base: UploadFile | None = File(
+        default=None,
+        alias="new_base",
+        description="New (patched) base OCI Image Layout tar, same platform",
+    ),
+    app: UploadFile | None = File(default=None, alias="app"),
+):
+    # Tolerate a couple of obvious field-name aliases.
+    app_image = app_image or app
+    missing = [
+        name
+        for name, value in (
+            ("app_image", app_image),
+            ("old_base", old_base),
+            ("new_base", new_base),
+        )
+        if value is None
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"missing required upload file field(s): {', '.join(missing)}",
+        )
+
+    work = tempfile.mkdtemp(prefix="req-", dir=WORK_ROOT)
+    try:
+        app_tar = os.path.join(work, f"{APP_LABEL}.tar")
+        old_tar = os.path.join(work, f"{OLD_BASE_LABEL}.tar")
+        new_tar = os.path.join(work, f"{NEW_BASE_LABEL}.tar")
+        _stream_upload(app_image, app_tar)
+        _stream_upload(old_base, old_tar)
+        _stream_upload(new_base, new_tar)
+
+        out_tar = os.path.join(work, "rebased-image.tar")
+        try:
+            rebase_image(app_tar, old_tar, new_tar, work, out_tar)
+        except RebaseOverlayError as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "layer_overlay_failed",
+                    "message": str(exc),
+                    "source_package": exc.source_package,
+                    "original_layer_number": exc.original_layer_number,
+                    "entry_path": exc.entry_path,
+                },
+            )
+        except RebaseError as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        logger.exception("unexpected error while rebasing")
+        raise HTTPException(status_code=500, detail="internal error")
+    return FileResponse(
+        out_tar,
+        media_type="application/x-tar",
+        filename="rebased-image.tar",
         background=BackgroundTask(partial(shutil.rmtree, work, ignore_errors=True)),
     )

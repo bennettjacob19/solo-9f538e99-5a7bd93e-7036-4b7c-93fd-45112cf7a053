@@ -19,6 +19,13 @@ Guarantees provided by this module:
   outside the per-request rootfs directory;
 * any missing blob, corruption or illegal path raises :class:`UnpackError`
   and the whole request fails -- no partial filesystem is produced.
+
+Layer-application failures raise :class:`LayerApplicationError`, which
+carries the 1-based manifest layer number and the offending entry path so
+callers (e.g. the rebase endpoint) can map the failure back to the
+original input package.  Nothing ever buffers a whole archive or a whole
+layer in memory: uploads, blob hashing, gzip decompression and tar
+production all stream in :data:`CHUNK`-sized blocks.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+from dataclasses import dataclass, field
 
 CHUNK = 1024 * 1024
 MAX_SYMLINK_DEPTH = 255
@@ -50,6 +58,22 @@ OPAQUE_MARKER = ".wh..wh..opq"
 
 class UnpackError(Exception):
     """Any invalid, missing or corrupt input. Aborts the whole request."""
+
+
+class LayerApplicationError(UnpackError):
+    """An entry of one layer could not be applied.
+
+    ``layer_number`` is 1-based (the position in the image manifest) and
+    ``entry_path`` is the offending tar member's normalized path.
+    """
+
+    def __init__(self, layer_number, entry_path, message):
+        self.layer_number = layer_number
+        self.entry_path = entry_path
+        full = f"layer {layer_number} entry {entry_path!r}: {message}"
+        super().__init__(full)
+        # keep the underlying message handy for structured responses
+        self.message = message
 
 
 # ---------------------------------------------------------------------------
@@ -159,87 +183,215 @@ def _verify_blob(path, descriptor, what):
     return actual
 
 
-def _prepare_layer(blob_path, media_type, expected_diff_id, workdir, index):
-    """Verify one layer blob, decompress if needed, verify its diff_id.
+def _stream_gunzip(blob_path, sink=None):
+    """Decompress a gzip blob in chunks; SHA-256 the uncompressed bytes.
 
-    Returns the path of the plain (uncompressed) layer tar.
+    When *sink* is an open binary file, the uncompressed stream is copied
+    into it as well.  Only :data:`CHUNK`-sized blocks are held in memory.
+    Returns the hex digest of the uncompressed content.
     """
+    h = hashlib.sha256()
+    try:
+        with gzip.open(blob_path, "rb") as src:
+            for blk in iter(lambda: src.read(CHUNK), b""):
+                h.update(blk)
+                if sink is not None:
+                    sink.write(blk)
+    except (OSError, EOFError) as e:
+        raise UnpackError(f"gzip decompression failed: {e}")
+    return h.hexdigest()
+
+
+def _diff_id_of_blob(blob_path, media_type):
+    """Compute the uncompressed SHA-256 (diff_id) of one layer blob."""
     if media_type in TAR_MEDIA_TYPES:
-        digest = _sha256_file(blob_path)
-        tar_path = blob_path
-    elif media_type in GZIP_MEDIA_TYPES:
-        tar_path = os.path.join(workdir, f"layer-{index}.tar")
-        h = hashlib.sha256()
-        try:
-            with gzip.open(blob_path, "rb") as src, open(tar_path, "wb") as dst:
-                for blk in iter(lambda: src.read(CHUNK), b""):
-                    h.update(blk)
-                    dst.write(blk)
-        except (OSError, EOFError) as e:
-            raise UnpackError(f"layer {index}: gzip decompression failed: {e}")
-        digest = h.hexdigest()
-    else:
-        raise UnpackError(f"layer {index}: unsupported mediaType {media_type!r}")
-    if digest != expected_diff_id:
-        raise UnpackError(
-            f"layer {index}: diff_id mismatch "
-            f"(config says sha256:{expected_diff_id}, got sha256:{digest})"
-        )
-    return tar_path
+        return _sha256_file(blob_path)
+    if media_type in GZIP_MEDIA_TYPES:
+        return _stream_gunzip(blob_path)
+    raise UnpackError(f"unsupported mediaType {media_type!r}")
 
 
-def load_and_verify(layout_dir, workdir):
-    """Verify the whole layout; return ordered list of plain layer tar paths."""
-    _read_json(os.path.join(layout_dir, "oci-layout"), "oci-layout")
+@dataclass
+class LayoutBundle:
+    """Everything an inspected single-manifest OCI Image Layout contains."""
+
+    layout_dir: str
+    index: dict
+    manifest_descriptor: dict
+    manifest: dict
+    config_descriptor: dict
+    config: dict
+    diff_ids: list = field(default_factory=list)  # hex strings, manifest order
+    layer_descriptors: list = field(default_factory=list)
+    # plain (decompressed) tar paths, same order; None entries mean "use the
+    # blob directly" (uncompressed layer or no decompress_dir requested)
+    prepared_tar_paths: list = field(default_factory=list)
+
+    def blob_path(self, digest):
+        hexd = digest.split(":", 1)[1] if digest.startswith("sha256:") else digest
+        return os.path.join(self.layout_dir, "blobs", "sha256", hexd)
+
+
+def inspect_layout(layout_dir, label="", decompress_dir=None):
+    """Parse and fully verify a layout on disk; return a :class:`LayoutBundle`.
+
+    The check covers: single manifest in index.json, presence/size/SHA-256
+    of every referenced blob, config ``rootfs.diff_ids`` against the
+    (decompressed) layer bytes, the history requirement (present, and the
+    non-empty entries pairing 1:1 with layers) and the platform fields.
+    Every error is prefixed with *label* (e.g. the input package name).
+
+    When *decompress_dir* is given, gzip layers are streamed into plain
+    tar files there in the same pass used for diff_id verification, so a
+    later unpack never has to gunzip a layer a second time.
+    """
+    prefix = f"{label}: " if label else ""
+
+    def fail(msg):
+        raise UnpackError(prefix + msg)
+
+    if not os.path.isfile(os.path.join(layout_dir, "oci-layout")):
+        fail("missing oci-layout")
+    layout_marker = _read_json(
+        os.path.join(layout_dir, "oci-layout"), "oci-layout"
+    )
+    if not isinstance(layout_marker, dict):
+        fail("oci-layout is not a JSON object")
     index = _read_json(os.path.join(layout_dir, "index.json"), "index.json")
     manifests = index.get("manifests") if isinstance(index, dict) else None
     if not isinstance(manifests, list) or not manifests:
-        raise UnpackError("index.json: no manifests")
+        fail("index.json: no manifests")
     if len(manifests) != 1:
-        raise UnpackError(
-            f"only single-manifest layouts are supported (got {len(manifests)})"
-        )
+        fail(f"only single-manifest layouts are supported (got {len(manifests)})")
 
     mdesc = manifests[0]
-    mhex = _parse_digest(mdesc.get("digest") if isinstance(mdesc, dict) else None)
+    if not isinstance(mdesc, dict):
+        fail("index.json: invalid manifest descriptor")
+    mhex = _parse_digest(mdesc.get("digest"), prefix + "manifest")
     mpath = os.path.join(layout_dir, "blobs", "sha256", mhex)
-    _verify_blob(mpath, mdesc, "manifest")
+    try:
+        _verify_blob(mpath, mdesc, prefix + "manifest")
+    except UnpackError as e:
+        fail(str(e))
     manifest = _read_json(mpath, "manifest")
     if not isinstance(manifest, dict):
-        raise UnpackError("manifest is not a JSON object")
+        fail("manifest is not a JSON object")
 
     cdesc = manifest.get("config")
-    chex = _parse_digest(cdesc.get("digest") if isinstance(cdesc, dict) else None)
+    if not isinstance(cdesc, dict):
+        fail("manifest: missing config descriptor")
+    chex = _parse_digest(cdesc.get("digest"), prefix + "config")
     cpath = os.path.join(layout_dir, "blobs", "sha256", chex)
-    _verify_blob(cpath, cdesc, "config")
+    try:
+        _verify_blob(cpath, cdesc, prefix + "config")
+    except UnpackError as e:
+        fail(str(e))
     config = _read_json(cpath, "config")
+    if not isinstance(config, dict):
+        fail("config is not a JSON object")
 
-    rootfs_cfg = config.get("rootfs") if isinstance(config, dict) else None
-    diff_ids = rootfs_cfg.get("diff_ids") if isinstance(rootfs_cfg, dict) else None
-    if not isinstance(diff_ids, list):
-        raise UnpackError("config: missing rootfs.diff_ids")
-    diff_ids = [_parse_digest(d) for d in diff_ids]
+    rootfs_cfg = config.get("rootfs")
+    diff_ids_raw = rootfs_cfg.get("diff_ids") if isinstance(rootfs_cfg, dict) else None
+    if not isinstance(diff_ids_raw, list):
+        fail("config: missing rootfs.diff_ids")
+    diff_ids = [_parse_digest(d, prefix + "config diff_id") for d in diff_ids_raw]
 
     layers = manifest.get("layers")
     if not isinstance(layers, list):
-        raise UnpackError("manifest: missing layers")
+        fail("manifest: missing layers")
     if len(layers) != len(diff_ids):
-        raise UnpackError(
-            f"manifest has {len(layers)} layers but config has "
-            f"{len(diff_ids)} diff_ids"
+        fail(
+            f"manifest layers ({len(layers)}) and config rootfs.diff_ids "
+            f"({len(diff_ids)}) count mismatch"
         )
 
-    tar_paths = []
-    for i, ldesc in enumerate(layers):
-        if not isinstance(ldesc, dict):
-            raise UnpackError(f"layer {i}: invalid descriptor")
-        lhex = _parse_digest(ldesc.get("digest"))
-        lpath = os.path.join(layout_dir, "blobs", "sha256", lhex)
-        _verify_blob(lpath, ldesc, f"layer {i}")
-        tar_paths.append(
-            _prepare_layer(lpath, ldesc.get("mediaType"), diff_ids[i], workdir, i)
+    # All three packages must carry history; empty_layer entries only take
+    # up a history slot, every other history entry pairs with one layer.
+    history = config.get("history")
+    if not isinstance(history, list) or not history:
+        fail("config: missing or empty history")
+    if not all(isinstance(h, dict) for h in history):
+        fail("config: history entries must be JSON objects")
+    non_empty_history = [h for h in history if h.get("empty_layer") is not True]
+    if len(non_empty_history) != len(diff_ids):
+        fail(
+            f"config: {len(history)} history entries "
+            f"({len(non_empty_history)} non-empty) do not match "
+            f"{len(diff_ids)} layers"
         )
-    return tar_paths
+
+    arch = config.get("architecture")
+    osname = config.get("os")
+    if not isinstance(arch, str) or not arch:
+        fail("config: missing architecture")
+    if not isinstance(osname, str) or not osname:
+        fail("config: missing os")
+
+    prepared_tar_paths = []
+    for i, ldesc in enumerate(layers):
+        layer_no = i + 1  # 1-based manifest layer number
+        if not isinstance(ldesc, dict):
+            fail(f"layer {layer_no}: invalid descriptor")
+        lhex = _parse_digest(ldesc.get("digest"), f"{prefix}layer {layer_no}")
+        lpath = os.path.join(layout_dir, "blobs", "sha256", lhex)
+        try:
+            _verify_blob(lpath, ldesc, f"{prefix}layer {layer_no}")
+        except UnpackError as e:
+            fail(str(e))
+        media_type = ldesc.get("mediaType")
+        if media_type in TAR_MEDIA_TYPES:
+            actual = _sha256_file(lpath)
+            prepared_tar_paths.append(lpath if decompress_dir else None)
+        elif media_type in GZIP_MEDIA_TYPES:
+            if decompress_dir is not None:
+                plain_path = os.path.join(decompress_dir, f"layer-{layer_no}.tar")
+                try:
+                    with open(plain_path, "wb") as dst:
+                        actual = _stream_gunzip(lpath, dst)
+                except UnpackError as e:
+                    fail(f"layer {layer_no}: {e}")
+                prepared_tar_paths.append(plain_path)
+            else:
+                try:
+                    actual = _stream_gunzip(lpath)
+                except UnpackError as e:
+                    fail(f"layer {layer_no}: {e}")
+                prepared_tar_paths.append(None)
+        else:
+            fail(f"layer {layer_no}: unsupported mediaType {media_type!r}")
+            actual = None  # unreachable, fail() raises
+        if actual != diff_ids[i]:
+            fail(
+                f"layer {layer_no}: diff_id mismatch "
+                f"(config says sha256:{diff_ids[i]}, got sha256:{actual})"
+            )
+
+    return LayoutBundle(
+        layout_dir=layout_dir,
+        index=index,
+        manifest_descriptor=mdesc,
+        manifest=manifest,
+        config_descriptor=cdesc,
+        config=config,
+        diff_ids=diff_ids,
+        layer_descriptors=list(layers),
+        prepared_tar_paths=prepared_tar_paths,
+    )
+
+
+def load_and_verify(layout_dir, workdir):
+    """Verify the whole layout; return ordered list of plain layer tar paths.
+
+    Gzip layers are decompressed once, in the same streaming pass that
+    verifies their diff_id.
+    """
+    bundle = inspect_layout(layout_dir, decompress_dir=workdir)
+    return [
+        prepared or bundle.blob_path(desc["digest"])
+        for prepared, desc in zip(
+            bundle.prepared_tar_paths, bundle.layer_descriptors
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -418,58 +570,80 @@ def _apply_entry(tf, member, rel, rootfs, dir_meta):
 # ---------------------------------------------------------------------------
 
 
-def apply_layer(tar_path, rootfs, dir_meta):
+def apply_layer(tar_path, rootfs, dir_meta, layer_number):
+    """Apply one plain layer tar onto *rootfs*.
+
+    *layer_number* is the 1-based position of the layer in the image
+    manifest; every entry-level failure is raised as
+    :class:`LayerApplicationError` carrying that number and the entry path.
+    """
     try:
         tf = tarfile.open(tar_path, "r:")
     except (tarfile.TarError, OSError) as e:
-        raise UnpackError(f"corrupt layer tar: {e}")
+        raise UnpackError(f"layer {layer_number}: corrupt layer tar: {e}")
     with tf:
         try:
             members = tf.getmembers()
         except tarfile.TarError as e:
-            raise UnpackError(f"corrupt layer tar: {e}")
+            raise UnpackError(f"layer {layer_number}: corrupt layer tar: {e}")
 
         entries = []
         deletions = []
         opaque_dirs = []
         for m in members:
-            parts = _normalize_archive_name(m.name, "layer entry")
+            try:
+                parts = _normalize_archive_name(m.name, "layer entry")
+            except UnpackError as e:
+                raise LayerApplicationError(layer_number, m.name, str(e))
             if not parts:
                 continue
             base = parts[-1]
+            rel = "/".join(parts)
             if base == OPAQUE_MARKER:
-                opaque_dirs.append(parts[:-1])
+                opaque_dirs.append((parts[:-1], rel))
             elif base.startswith(WHITEOUT_PREFIX):
                 target_name = base[len(WHITEOUT_PREFIX):]
                 if not target_name:
-                    raise UnpackError(f"invalid whiteout entry: {m.name!r}")
-                deletions.append(parts[:-1] + [target_name])
+                    raise LayerApplicationError(
+                        layer_number, rel, "invalid whiteout entry"
+                    )
+                deletions.append((parts[:-1] + [target_name], rel))
             else:
-                entries.append((m, parts))
+                entries.append((m, parts, rel))
 
         # Phase 1: deletions apply to the *lower* filesystem state only.
         # They are all executed before anything from this layer is written,
         # so a marker can never delete same-layer content regardless of its
         # position inside the layer tar.
-        for target in deletions:
-            p = _resolve_within(rootfs, "/".join(target))
-            _remove_existing(p)
-            _drop_dir_meta(dir_meta, p, include_self=True)
-        for d in opaque_dirs:
-            p = _resolve_within(rootfs, "/".join(d)) if d else rootfs
-            if os.path.isdir(p):
-                for child in os.listdir(p):
-                    _remove_existing(os.path.join(p, child))
-            _drop_dir_meta(dir_meta, p, include_self=False)
+        for target, marker_rel in deletions:
+            try:
+                p = _resolve_within(rootfs, "/".join(target))
+                _remove_existing(p)
+                _drop_dir_meta(dir_meta, p, include_self=True)
+            except UnpackError as e:
+                raise LayerApplicationError(layer_number, marker_rel, str(e))
+        for d, marker_rel in opaque_dirs:
+            try:
+                p = _resolve_within(rootfs, "/".join(d)) if d else rootfs
+                if os.path.isdir(p):
+                    for child in os.listdir(p):
+                        _remove_existing(os.path.join(p, child))
+                _drop_dir_meta(dir_meta, p, include_self=False)
+            except UnpackError as e:
+                raise LayerApplicationError(layer_number, marker_rel, str(e))
 
         # Phase 2: write this layer's new content in tar order.
-        for m, parts in entries:
+        for m, parts, rel in entries:
             try:
-                _apply_entry(tf, m, "/".join(parts), rootfs, dir_meta)
-            except UnpackError:
+                _apply_entry(tf, m, rel, rootfs, dir_meta)
+            except LayerApplicationError:
                 raise
+            except UnpackError as e:
+                raise LayerApplicationError(layer_number, rel, str(e))
             except (OSError, ValueError, tarfile.TarError) as e:
-                raise UnpackError(f"failed to apply entry {m.name!r}: {e}")
+                raise LayerApplicationError(
+                    layer_number, rel, f"failed to apply entry: {e}"
+                )
 
 
 def _apply_deferred_dir_meta(dir_meta):
@@ -559,6 +733,22 @@ def build_rootfs_tar(rootfs, out_path):
 # ---------------------------------------------------------------------------
 
 
+def unpack_layout_dir(layout_dir, workdir):
+    """Verify and unpack an already-extracted layout directory."""
+    layer_tars = load_and_verify(layout_dir, workdir)
+
+    rootfs = os.path.join(workdir, "rootfs")
+    os.makedirs(rootfs)
+    dir_meta = {}
+    for i, tar_path in enumerate(layer_tars, start=1):
+        apply_layer(tar_path, rootfs, dir_meta, i)
+    _apply_deferred_dir_meta(dir_meta)
+
+    out_path = os.path.join(workdir, "rootfs.tar")
+    build_rootfs_tar(rootfs, out_path)
+    return out_path
+
+
 def unpack_image(upload_path, workdir):
     """Unpack the uploaded layout tar; return the path of the rootfs.tar.
 
@@ -567,15 +757,4 @@ def unpack_image(upload_path, workdir):
     layout_dir = os.path.join(workdir, "layout")
     os.makedirs(layout_dir)
     extract_layout(upload_path, layout_dir)
-    layer_tars = load_and_verify(layout_dir, workdir)
-
-    rootfs = os.path.join(workdir, "rootfs")
-    os.makedirs(rootfs)
-    dir_meta = {}
-    for tar_path in layer_tars:
-        apply_layer(tar_path, rootfs, dir_meta)
-    _apply_deferred_dir_meta(dir_meta)
-
-    out_path = os.path.join(workdir, "rootfs.tar")
-    build_rootfs_tar(rootfs, out_path)
-    return out_path
+    return unpack_layout_dir(layout_dir, workdir)
